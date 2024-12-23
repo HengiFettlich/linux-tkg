@@ -703,7 +703,7 @@ new file mode 100644
 index 000000000000..c59691742340
 --- /dev/null
 +++ b/kernel/sched/alt_core.c
-@@ -0,0 +1,7458 @@
+@@ -0,0 +1,7529 @@
 +/*
 + *  kernel/sched/alt_core.c
 + *
@@ -1474,10 +1474,9 @@ index 000000000000..c59691742340
 + * this avoids any races wrt polling state changes and thereby avoids
 + * spurious IPIs.
 + */
-+static inline bool set_nr_and_not_polling(struct task_struct *p)
++static inline bool set_nr_and_not_polling(struct thread_info *ti, int tif)
 +{
-+	struct thread_info *ti = task_thread_info(p);
-+	return !(fetch_or(&ti->flags, _TIF_NEED_RESCHED) & _TIF_POLLING_NRFLAG);
++	return !(fetch_or(&ti->flags, 1 << tif) & _TIF_POLLING_NRFLAG);
 +}
 +
 +/*
@@ -1502,9 +1501,9 @@ index 000000000000..c59691742340
 +}
 +
 +#else
-+static inline bool set_nr_and_not_polling(struct task_struct *p)
++static inline bool set_nr_and_not_polling(struct thread_info *ti, int tif)
 +{
-+	set_tsk_need_resched(p);
++	set_ti_thread_flag(ti, tif);
 +	return true;
 +}
 +
@@ -1611,25 +1610,68 @@ index 000000000000..c59691742340
 + */
 +static inline void resched_curr(struct rq *rq)
 +{
++	__resched_curr(rq, TIF_NEED_RESCHED);
++}
++
++static inline void __resched_curr(struct rq *rq, int tif)
++{
 +	struct task_struct *curr = rq->curr;
++	struct thread_info *cti = task_thread_info(curr);
 +	int cpu;
 +
-+	lockdep_assert_held(&rq->lock);
++	lockdep_assert_rq_held(rq);
 +
-+	if (test_tsk_need_resched(curr))
++	/*
++	 * Always immediately preempt the idle task; no point in delaying doing
++	 * actual work.
++	 */
++	if (is_idle_task(curr) && tif == TIF_NEED_RESCHED_LAZY)
++		tif = TIF_NEED_RESCHED;
++
++	if (cti->flags & ((1 << tif) | _TIF_NEED_RESCHED))
 +		return;
 +
 +	cpu = cpu_of(rq);
++
 +	if (cpu == smp_processor_id()) {
-+		set_tsk_need_resched(curr);
-+		set_preempt_need_resched();
++		set_ti_thread_flag(cti, tif);
++		if (tif == TIF_NEED_RESCHED)
++			set_preempt_need_resched();
 +		return;
 +	}
 +
-+	if (set_nr_and_not_polling(curr))
-+		smp_send_reschedule(cpu);
-+	else
++	if (set_nr_and_not_polling(cti, tif)) {
++		if (tif == TIF_NEED_RESCHED)
++			smp_send_reschedule(cpu);
++	} else {
 +		trace_sched_wake_idle_without_ipi(cpu);
++	}
++}
++
++#ifdef CONFIG_PREEMPT_DYNAMIC
++static DEFINE_STATIC_KEY_FALSE(sk_dynamic_preempt_lazy);
++static __always_inline bool dynamic_preempt_lazy(void)
++{
++	return static_branch_unlikely(&sk_dynamic_preempt_lazy);
++}
++#else
++static __always_inline bool dynamic_preempt_lazy(void)
++{
++	return IS_ENABLED(CONFIG_PREEMPT_LAZY);
++}
++#endif
++
++static __always_inline int get_lazy_tif_bit(void)
++{
++	if (dynamic_preempt_lazy())
++		return TIF_NEED_RESCHED_LAZY;
++
++	return TIF_NEED_RESCHED;
++}
++
++void resched_curr_lazy(struct rq *rq)
++{
++	__resched_curr(rq, get_lazy_tif_bit());
 +}
 +
 +void resched_cpu(int cpu)
@@ -1725,7 +1767,7 @@ index 000000000000..c59691742340
 +	 * and testing of the above solutions didn't appear to report
 +	 * much benefits.
 +	 */
-+	if (set_nr_and_not_polling(rq->idle))
++	if (set_nr_and_not_polling(task_thread_info(rq->idle), TIF_NEED_RESCHED))
 +		smp_send_reschedule(cpu);
 +	else
 +		trace_sched_wake_idle_without_ipi(cpu);
@@ -5995,6 +6037,7 @@ index 000000000000..c59691742340
 +	preempt_dynamic_none,
 +	preempt_dynamic_voluntary,
 +	preempt_dynamic_full,
++	preempt_dynamic_lazy,
 +};
 +
 +int preempt_dynamic_mode = preempt_dynamic_undefined;
@@ -6010,15 +6053,23 @@ index 000000000000..c59691742340
 +	if (!strcmp(str, "full"))
 +		return preempt_dynamic_full;
 +
++#ifdef CONFIG_ARCH_HAS_PREEMPT_LAZY
++	if (!strcmp(str, "lazy"))
++		return preempt_dynamic_lazy;
++#endif
++
 +	return -EINVAL;
 +}
++
++#define preempt_dynamic_key_enable(f)	static_key_enable(&sk_dynamic_##f.key)
++#define preempt_dynamic_key_disable(f)	static_key_disable(&sk_dynamic_##f.key)
 +
 +#if defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)
 +#define preempt_dynamic_enable(f)	static_call_update(f, f##_dynamic_enabled)
 +#define preempt_dynamic_disable(f)	static_call_update(f, f##_dynamic_disabled)
 +#elif defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)
-+#define preempt_dynamic_enable(f)	static_key_enable(&sk_dynamic_##f.key)
-+#define preempt_dynamic_disable(f)	static_key_disable(&sk_dynamic_##f.key)
++#define preempt_dynamic_enable(f)	preempt_dynamic_key_enable(f)
++#define preempt_dynamic_disable(f)	preempt_dynamic_key_disable(f)
 +#else
 +#error "Unsupported PREEMPT_DYNAMIC mechanism"
 +#endif
@@ -6039,6 +6090,7 @@ index 000000000000..c59691742340
 +	preempt_dynamic_enable(preempt_schedule);
 +	preempt_dynamic_enable(preempt_schedule_notrace);
 +	preempt_dynamic_enable(irqentry_exit_cond_resched);
++	preempt_dynamic_key_disable(preempt_lazy);
 +
 +	switch (mode) {
 +	case preempt_dynamic_none:
@@ -6048,6 +6100,7 @@ index 000000000000..c59691742340
 +		preempt_dynamic_disable(preempt_schedule);
 +		preempt_dynamic_disable(preempt_schedule_notrace);
 +		preempt_dynamic_disable(irqentry_exit_cond_resched);
++		preempt_dynamic_key_disable(preempt_lazy);
 +		if (mode != preempt_dynamic_mode)
 +			pr_info("Dynamic Preempt: none\n");
 +		break;
@@ -6059,6 +6112,7 @@ index 000000000000..c59691742340
 +		preempt_dynamic_disable(preempt_schedule);
 +		preempt_dynamic_disable(preempt_schedule_notrace);
 +		preempt_dynamic_disable(irqentry_exit_cond_resched);
++		preempt_dynamic_key_disable(preempt_lazy);
 +		if (mode != preempt_dynamic_mode)
 +			pr_info("Dynamic Preempt: voluntary\n");
 +		break;
@@ -6070,8 +6124,21 @@ index 000000000000..c59691742340
 +		preempt_dynamic_enable(preempt_schedule);
 +		preempt_dynamic_enable(preempt_schedule_notrace);
 +		preempt_dynamic_enable(irqentry_exit_cond_resched);
++		preempt_dynamic_key_disable(preempt_lazy);
 +		if (mode != preempt_dynamic_mode)
 +			pr_info("Dynamic Preempt: full\n");
++		break;
++
++	case preempt_dynamic_lazy:
++		if (!klp_override)
++			preempt_dynamic_disable(cond_resched);
++		preempt_dynamic_disable(might_resched);
++		preempt_dynamic_enable(preempt_schedule);
++		preempt_dynamic_enable(preempt_schedule_notrace);
++		preempt_dynamic_enable(irqentry_exit_cond_resched);
++		preempt_dynamic_key_enable(preempt_lazy);
++		if (mode != preempt_dynamic_mode)
++			pr_info("Dynamic Preempt: lazy\n");
 +		break;
 +	}
 +
@@ -6136,6 +6203,8 @@ index 000000000000..c59691742340
 +			sched_dynamic_update(preempt_dynamic_none);
 +		} else if (IS_ENABLED(CONFIG_PREEMPT_VOLUNTARY)) {
 +			sched_dynamic_update(preempt_dynamic_voluntary);
++		} else if (IS_ENABLED(CONFIG_PREEMPT_LAZY)) {
++			sched_dynamic_update(preempt_dynamic_lazy);
 +		} else {
 +			/* Default static call setting, nothing to do */
 +			WARN_ON_ONCE(!IS_ENABLED(CONFIG_PREEMPT));
@@ -6156,6 +6225,7 @@ index 000000000000..c59691742340
 +PREEMPT_MODEL_ACCESSOR(none);
 +PREEMPT_MODEL_ACCESSOR(voluntary);
 +PREEMPT_MODEL_ACCESSOR(full);
++PREEMPT_MODEL_ACCESSOR(lazy);
 +
 +#else /* !CONFIG_PREEMPT_DYNAMIC: */
 +
@@ -8424,7 +8494,7 @@ new file mode 100644
 index 000000000000..09c9e9f80bf4
 --- /dev/null
 +++ b/kernel/sched/alt_sched.h
-@@ -0,0 +1,971 @@
+@@ -0,0 +1,973 @@
 +#ifndef _KERNEL_SCHED_ALT_SCHED_H
 +#define _KERNEL_SCHED_ALT_SCHED_H
 +
@@ -8974,6 +9044,8 @@ index 000000000000..09c9e9f80bf4
 +#endif
 +}
 +
++extern void resched_curr(struct rq *rq);
++extern void resched_curr_lazy(struct rq *rq);
 +extern void resched_cpu(int cpu);
 +
 +#include "stats.h"
